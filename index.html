@@ -171,6 +171,13 @@
   let bestComboTime = Infinity;
   let bestComboLabel = null;
 
+  // Correct (fastest-settling) combo for scoring
+  const CORRECT_COMBO = {
+    density: "High",
+    size: "Cobble (big)",
+    shape: "Round"
+  };
+
   function allTested() {
     for (const k of ALL_TEST_KEYS) if (!tested.has(k)) return false;
     return true;
@@ -772,49 +779,77 @@
     ensureGenerated(worldW, camY, viewH);
   }
 
-  function endRun(finalSeconds) {
+  function endRun(finalSeconds, finalProfile) {
     if (runMode === "single" && runKey) {
       tested.add(runKey);
       const prev = bestTimes.get(runKey);
       if (prev === undefined || finalSeconds < prev) bestTimes.set(runKey, finalSeconds);
     }
-
-    if (runMode === "combo") {
-      if (finalSeconds < bestComboTime) {
-        bestComboTime = finalSeconds;
-        bestComboLabel = runLabel;
-      }
-    }
-
     state = "postRun";
     postEl.style.display = "flex";
     menuEl.style.display = "none";
     hudEl.style.display = "none";
 
-    const unlocked = allTested();
+        let text = "";
 
-    let text = "";
-    text += "RUN COMPLETE\n";
-    text += "----------------------------------------\n";
-    text += runLabel + "\n";
-    text += `Time: ${finalSeconds.toFixed(2)} s\n\n`;
+    // Special centered results screen for FINAL LEVEL (combo)
+    if (runMode === "combo" && finalProfile) {
+      const dOk = finalProfile.density === CORRECT_COMBO.density;
+      const sOk = finalProfile.size === CORRECT_COMBO.size;
+      const shOk = finalProfile.shape === CORRECT_COMBO.shape;
+      const score = (dOk ? 1 : 0) + (sOk ? 1 : 0) + (shOk ? 1 : 0);
+
+      const mark = (ok) => ok ? "✓" : "✗";
+
+      text += "FINAL RESULTS\\n";
+      text += "----------------------------------------\\n";
+      text += `Density: ${finalProfile.density}  [${mark(dOk)}]\\n`;
+      text += `Size:    ${finalProfile.size}  [${mark(sOk)}]\\n`;
+      text += `Shape:   ${finalProfile.shape}  [${mark(shOk)}]\\n`;
+      text += "\\n";
+      text += `Time: ${finalSeconds.toFixed(2)} s\\n`;
+      if (score === 3) {
+        text += "Score: 3 / 3  (Perfect)\\n";
+      } else {
+        text += `Score: ${score} / 3\\n`;
+      }
+
+      // Track best combo time
+      if (finalSeconds < bestComboTime) {
+        bestComboTime = finalSeconds;
+        bestComboLabel = runLabel;
+      }
+
+      text += "\\n----------------------------------------\\n";
+      text += "Press Enter to return to menu\\n";
+      postText.textContent = text;
+      return;
+    }
+
+    // Default (single-property test) results screen
+    text += "RUN COMPLETE\\n";
+    text += "----------------------------------------\\n";
+    text += runLabel + "\\n";
+    text += `Time: ${finalSeconds.toFixed(2)} s\\n\\n`;
 
     if (runMode === "single" && runKey) {
       const best = bestTimes.get(runKey);
-      if (best !== undefined) text += `Best for this test: ${best.toFixed(2)} s\n`;
+      if (best !== undefined) text += `Best for this test: ${best.toFixed(2)} s\\n`;
     }
+
+    const unlocked = allTested();
 
     if (unlocked) {
-      text += "\nFINAL LEVEL UNLOCKED\n";
-      if (bestComboLabel) text += `Best Combo So Far: ${bestComboLabel} (${bestComboTime.toFixed(2)} s)\n`;
+      text += "\\nFINAL LEVEL UNLOCKED\\n";
+      if (bestComboLabel) text += `Best Combo So Far: ${bestComboLabel} (${bestComboTime.toFixed(2)} s)\\n`;
     } else {
-      text += `\nTested: ${tested.size} / ${ALL_TEST_KEYS.length}\n`;
+      text += `\\nTested: ${tested.size} / ${ALL_TEST_KEYS.length}\\n`;
     }
 
-    text += "\n----------------------------------------\n";
-    text += "Test New Particle (press Enter)\n";
-    text += "----------------------------------------\n";
-    text += "Note: options with * in the menu have been tested.\n";
+    text += "\\n----------------------------------------\\n";
+    text += "Test New Particle (press Enter)\\n";
+    text += "----------------------------------------\\n";
+    text += "Note: options with * in the menu have been tested.\\n";
 
     postText.textContent = text;
   }
@@ -955,7 +990,7 @@
     if (player.y >= WORLD_H - 10 && timerEnd === null) {
       timerEnd = performance.now();
       const seconds = (timerEnd - (timerStart ?? timerEnd)) / 1000;
-      endRun(seconds);
+      endRun(seconds, player.profile);
       return;
     }
 
