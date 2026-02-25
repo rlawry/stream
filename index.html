@@ -1,0 +1,1078 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Vertical Particle Matrix Runner (WebGL) — Incompressible Matrix</title>
+  <style>
+    html, body { margin:0; height:100%; background:#111; overflow:hidden; }
+    canvas{
+      display:block; width:100vw; height:100vh;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+    .overlay{
+      position:fixed; inset:0;
+      display:flex; align-items:center; justify-content:center;
+      font:16px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      color:#d7ffd7;
+      background:rgba(0,0,0,.85);
+      user-select:none;
+    }
+    .panel{
+      border:2px solid #2bff7a;
+      padding:18px 22px;
+      min-width:560px;
+      box-shadow: 0 0 0 2px rgba(43,255,122,.15), 0 14px 40px rgba(0,0,0,.5);
+      white-space:pre;
+    }
+    .dim{ color:#8bcf8b; }
+    .hud{
+      position:fixed; left:12px; top:12px;
+      font:14px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      color:#eaffea;
+      background:rgba(0,0,0,.55);
+      padding:10px 12px;
+      border:1px solid rgba(43,255,122,.35);
+      border-radius:10px;
+      user-select:none;
+    }
+    .hud b{ color:#fff; }
+  </style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div id="menu" class="overlay">
+  <div class="panel" id="menuText"></div>
+</div>
+
+<div id="post" class="overlay" style="display:none;">
+  <div class="panel" id="postText"></div>
+</div>
+
+<div id="hud" class="hud" style="display:none;"></div>
+
+<script>
+(() => {
+  // =========================
+  // CONFIG
+  // =========================
+  const WORLD_H = 5000;
+
+  // Water "matrix" lattice spacing / size
+  const SPACING = 14;
+  const R_MIN = 1.6, R_MAX = 2.4;
+
+  const GENERATE_AHEAD = 1200;
+  const CULL_BEHIND = 800;
+
+  const ACTIVE_PAD_TOP = 600;
+  const ACTIVE_PAD_BOTTOM = 900;
+
+  // -------------------------
+  // FLUID + SETTLING PHYSICS
+  // -------------------------
+  const RHO_W = 1.00;          // fluid density baseline
+  const G_PX  = 1300;          // gravity scale (px/s^2)
+
+  // Drag on player relative to local fluid velocity u(x,y,t)
+  const DRAG_QUAD_K = 0.00055;
+  const DRAG_LIN_K  = 0.090;
+
+  // Background water motion (eddies)
+  const TURB_AMP = 55;         // px/s
+  const TURB_K   = 0.010;      // spatial frequency
+
+  // Visual displacement of the matrix (keeps constant point density)
+  const MATRIX_DISP = 0.18;    // (seconds) approx: disp = u * MATRIX_DISP
+
+  // Visual wake around settling object
+  const WAKE_RADIUS_PAD = 48;
+  const WAKE_PUSH_PX = 6.0;    // max px of wake push
+
+  // Player user input (nudges only; settling is primarily gravity+buoyancy+drag)
+  const PLAYER_NUDGE_X = 550;  // px/s^2
+  const PLAYER_SHOVE_Y = 0;    // set to 0 for clean timing comparisons
+  const MAX_SPEED = 900;
+
+  // Player shape drag coefficients (bigger => slower)
+  const CD_ROUND = 0.85;
+  const CD_OVAL  = 1.20;
+  const CD_FLAT  = 2.30;
+
+  // Flat rectangle flutter/alignment (visual + affects Cd/area effective)
+  const ALIGN_K = 4.0;
+  const FLUTTER_K = 10.0;
+  const ANG_DAMP = 0.985;
+
+  // Mass scaling (geometric volume -> simulation mass)
+  const MASS_SCALE = 0.00042;
+
+  // =========================
+  // HELPERS
+  // =========================
+  function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+  function hypot2(x,y){ return Math.sqrt(x*x + y*y); }
+  function wrapPi(a){
+    a = (a + Math.PI) % (Math.PI*2);
+    if (a < 0) a += Math.PI*2;
+    return a - Math.PI;
+  }
+  function hash01(a){
+    const s = Math.sin(a) * 43758.5453123;
+    return s - Math.floor(s);
+  }
+
+  // Divergence-free (incompressible) flow field via streamfunction:
+  // u = (∂ψ/∂y, -∂ψ/∂x) => div(u)=0
+  function fluidVel(x, y, t){
+    const k1 = TURB_K;
+    const k2 = TURB_K * 1.7;
+
+    const A1 = TURB_AMP;
+    const A2 = TURB_AMP * 0.55;
+
+    const p1x = k1 * x + t * 0.90;
+    const p1y = k1 * y - t * 0.70;
+
+    const p2x = k2 * x - t * 0.42 + 1.3;
+    const p2y = k2 * y + t * 0.61 - 0.8;
+
+    const ux =
+      A1 * Math.sin(p1x) * Math.cos(p1y) * k1 +
+      A2 * Math.sin(p2x) * Math.cos(p2y) * k2;
+
+    const uy =
+      -(A1 * Math.cos(p1x) * Math.sin(p1y) * k1 +
+        A2 * Math.cos(p2x) * Math.sin(p2y) * k2);
+
+    return { ux, uy };
+  }
+
+  // =========================
+  // MENU / PROFILES
+  // =========================
+  const categories = ["Density", "Size", "Shape"];
+  const densityOptions = ["High", "Medium", "Low"];
+  const sizeOptions = ["Cobble (big)", "Pebble (medium)", "Sand (small)"];
+  const shapeOptions = ["Flat (rectangle)", "Oval", "Round"];
+
+  const FINAL_MENU_LABEL = "Final Level: Build Fastest Particle";
+
+  const ALL_TEST_KEYS = [
+    ...densityOptions.map(o => `Density:${o}`),
+    ...sizeOptions.map(o => `Size:${o}`),
+    ...shapeOptions.map(o => `Shape:${o}`),
+  ];
+
+  const tested = new Set();
+  const bestTimes = new Map();
+  let bestComboTime = Infinity;
+  let bestComboLabel = null;
+
+  function allTested() {
+    for (const k of ALL_TEST_KEYS) if (!tested.has(k)) return false;
+    return true;
+  }
+
+  function playerDefaults() {
+    return { density: "Medium", size: "Pebble (medium)", shape: "Round" };
+  }
+
+  function sizeToBaseRadius(sizeStr) {
+    if (sizeStr.startsWith("Cobble")) return 18;
+    if (sizeStr.startsWith("Pebble")) return 12;
+    return 7;
+  }
+
+  function densityToRho(d) {
+    // relative density to water (all sink here)
+    if (d === "High") return 2.8;
+    if (d === "Medium") return 2.2;
+    return 1.4;
+  }
+
+  // Shape spec:
+  //  - { kind:"rect", hx, hy, baseR, w, h }
+  //  - { kind:"circles", comps:[{ox,oy,r}, ...], baseR }
+  function buildPlayerShape(profile) {
+    const baseR = sizeToBaseRadius(profile.size);
+
+    if (profile.shape.startsWith("Flat")) {
+      const w = baseR * 2.4;
+      const h = Math.max(5, baseR * 0.7);
+      return { kind:"rect", hx: w * 0.5, hy: h * 0.5, baseR, w, h };
+    }
+
+    if (profile.shape.startsWith("Oval")) {
+      const r = baseR * 0.85;
+      const sep = baseR * 0.90;
+      return { kind:"circles", baseR, comps: [
+        { ox: -sep * 0.5, oy: 0, r },
+        { ox:  sep * 0.5, oy: 0, r },
+      ]};
+    }
+
+    return { kind:"circles", baseR, comps: [{ ox: 0, oy: 0, r: baseR }] };
+  }
+
+  function computePlayerHydro(profile, shapeSpec) {
+    const baseR = shapeSpec.baseR;
+
+    if (profile.shape.startsWith("Flat")) {
+      const Cd = CD_FLAT;
+      const w = shapeSpec.w;
+      const h = shapeSpec.h;
+      const area = w * h;
+      const charLen = Math.max(w, h);
+      const thickness = Math.max(3.5, baseR * 0.35);
+      const volume = area * thickness;
+      return { Cd, area, charLen, volume };
+    }
+
+    if (profile.shape.startsWith("Oval")) {
+      const Cd = CD_OVAL;
+      const a = baseR * 1.10;
+      const b = baseR * 0.80;
+      const area = Math.PI * a * b;
+      const charLen = baseR * 1.10;
+      const c = baseR * 0.75;
+      const volume = (4/3) * Math.PI * a * b * c;
+      return { Cd, area, charLen, volume };
+    }
+
+    const Cd = CD_ROUND;
+    const area = Math.PI * baseR * baseR;
+    const charLen = baseR;
+    const volume = (4/3) * Math.PI * baseR * baseR * baseR;
+    return { Cd, area, charLen, volume };
+  }
+
+  function optionsForCategory(cat) {
+    if (cat === "Density") return densityOptions;
+    if (cat === "Size") return sizeOptions;
+    return shapeOptions;
+  }
+
+  function categoryFullyTested(cat) {
+    const opts = optionsForCategory(cat);
+    for (const o of opts) if (!tested.has(`${cat}:${o}`)) return false;
+    return true;
+  }
+
+  function formatOption(cat, opt) {
+    const k = `${cat}:${opt}`;
+    return opt + (tested.has(k) ? " *" : "");
+  }
+
+  // =========================
+  // WEBGL2 SETUP
+  // =========================
+  const canvas = document.getElementById("gl");
+  const gl = canvas.getContext("webgl2", {
+    antialias:false, alpha:false, depth:false, stencil:false, premultipliedAlpha:false
+  });
+  if (!gl) { alert("WebGL2 required."); return; }
+
+  function dprInt() { return Math.max(1, Math.floor(window.devicePixelRatio || 1)); }
+  function resize() {
+    const dpr = dprInt();
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  window.addEventListener("resize", resize, { passive:true });
+  resize();
+
+  function compileShader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      const msg = gl.getShaderInfoLog(s);
+      gl.deleteShader(s);
+      throw new Error(msg);
+    }
+    return s;
+  }
+  function createProgram(vs, fs) {
+    const p = gl.createProgram();
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      const msg = gl.getProgramInfoLog(p);
+      gl.deleteProgram(p);
+      throw new Error(msg);
+    }
+    return p;
+  }
+
+  // ---- particles (points)
+  const vsPoints = `#version 300 es
+  precision highp float;
+  layout(location=0) in vec2 a_pos;   // device px
+  layout(location=1) in float a_r;    // device px
+  layout(location=2) in float a_heat;
+
+  uniform vec2 u_cam; // device px
+  uniform vec2 u_res; // device px
+
+  out float v_heat;
+
+  void main() {
+    vec2 p = a_pos - u_cam;
+    vec2 clip = vec2((p.x / u_res.x) * 2.0 - 1.0,
+                     1.0 - (p.y / u_res.y) * 2.0);
+    gl_Position = vec4(clip, 0.0, 1.0);
+    gl_PointSize = max(1.0, a_r * 2.0);
+    v_heat = a_heat;
+  }`;
+
+  const fsPoints = `#version 300 es
+  precision highp float;
+  in float v_heat;
+
+  uniform vec3 u_ambient;
+  uniform vec3 u_hot;
+
+  out vec4 outColor;
+
+  void main() {
+    vec2 c = gl_PointCoord * 2.0 - 1.0;
+    float d = dot(c,c);
+    if (d > 1.0) discard;
+
+    float t = clamp(v_heat, 0.0, 1.0);
+    vec3 col = mix(u_ambient, u_hot, t);
+    float a = smoothstep(1.0, 0.88, d);
+    outColor = vec4(col, a);
+  }`;
+
+  const progPoints = createProgram(
+    compileShader(gl.VERTEX_SHADER, vsPoints),
+    compileShader(gl.FRAGMENT_SHADER, fsPoints)
+  );
+
+  const u_cam_pts = gl.getUniformLocation(progPoints, "u_cam");
+  const u_res_pts = gl.getUniformLocation(progPoints, "u_res");
+  const u_amb_pts = gl.getUniformLocation(progPoints, "u_ambient");
+  const u_hot_pts = gl.getUniformLocation(progPoints, "u_hot");
+
+  const vaoPts = gl.createVertexArray();
+  const vboPts = gl.createBuffer();
+  gl.bindVertexArray(vaoPts);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboPts);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 16, 8);
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 16, 12);
+  gl.bindVertexArray(null);
+
+  // ---- rectangle (player)
+  const vsRect = `#version 300 es
+  precision highp float;
+  layout(location=0) in vec2 a_corner;
+
+  uniform vec2 u_center;
+  uniform vec2 u_half;
+  uniform float u_angle;
+  uniform vec2 u_cam;
+  uniform vec2 u_res;
+
+  out vec2 v_local;
+
+  void main() {
+    v_local = a_corner;
+    float c = cos(u_angle);
+    float s = sin(u_angle);
+    vec2 local = a_corner * u_half;
+    vec2 rot = vec2(c*local.x - s*local.y,
+                    s*local.x + c*local.y);
+    vec2 p = (u_center + rot) - u_cam;
+    vec2 clip = vec2((p.x / u_res.x) * 2.0 - 1.0,
+                     1.0 - (p.y / u_res.y) * 2.0);
+    gl_Position = vec4(clip, 0.0, 1.0);
+  }`;
+
+  const fsRect = `#version 300 es
+  precision highp float;
+  in vec2 v_local;
+
+  uniform vec3 u_fill;
+  uniform vec3 u_edge;
+
+  out vec4 outColor;
+
+  void main() {
+    vec2 a = abs(v_local);
+    float edge = step(0.92, max(a.x, a.y));
+    vec3 col = mix(u_fill, u_edge, edge);
+    outColor = vec4(col, 1.0);
+  }`;
+
+  const progRect = createProgram(
+    compileShader(gl.VERTEX_SHADER, vsRect),
+    compileShader(gl.FRAGMENT_SHADER, fsRect)
+  );
+
+  const u_center_rc = gl.getUniformLocation(progRect, "u_center");
+  const u_half_rc   = gl.getUniformLocation(progRect, "u_half");
+  const u_angle_rc  = gl.getUniformLocation(progRect, "u_angle");
+  const u_cam_rc    = gl.getUniformLocation(progRect, "u_cam");
+  const u_res_rc    = gl.getUniformLocation(progRect, "u_res");
+  const u_fill_rc   = gl.getUniformLocation(progRect, "u_fill");
+  const u_edge_rc   = gl.getUniformLocation(progRect, "u_edge");
+
+  const vaoRect = gl.createVertexArray();
+  const vboRect = gl.createBuffer();
+  gl.bindVertexArray(vaoRect);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vboRect);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1,-1,  1,-1,  1, 1,
+    -1,-1,  1, 1, -1, 1
+  ]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 8, 0);
+  gl.bindVertexArray(null);
+
+  // =========================
+  // WATER MATRIX (CPU)
+  // Fixed lattice positions + visual displacement (no compress/expand)
+  // =========================
+  let pbx = [], pby = [];     // base lattice positions
+  let px = [], py = [];       // rendered positions
+  let pr = [], pheat = [], pseed = [];
+  let pCount = 0;
+
+  function swapRemove(i) {
+    const j = pCount - 1;
+    pbx[i] = pbx[j]; pby[i] = pby[j];
+    px[i]  = px[j];  py[i]  = py[j];
+    pr[i] = pr[j];
+    pheat[i] = pheat[j];
+    pseed[i] = pseed[j];
+    pCount--;
+  }
+
+  function xorshift32(s) {
+    s ^= (s << 13); s >>>= 0;
+    s ^= (s >>> 17); s >>>= 0;
+    s ^= (s << 5); s >>>= 0;
+    return s >>> 0;
+  }
+  function rand01(seed) { return xorshift32(seed) / 4294967295; }
+
+  function addParticle(x, y, r, seed01) {
+    pbx[pCount] = x; pby[pCount] = y;
+    px[pCount] = x; py[pCount] = y;
+    pr[pCount] = r;
+    pheat[pCount] = 0;
+    pseed[pCount] = seed01;
+    pCount++;
+  }
+
+  let generatedY = 0;
+
+  function ensureGenerated(worldW, camY, viewH) {
+    const targetY = Math.min(WORLD_H, camY + viewH + GENERATE_AHEAD);
+    const startRow = Math.floor(generatedY / SPACING);
+    const endRow = Math.floor(targetY / SPACING);
+
+    for (let row = startRow; row <= endRow; row++) {
+      const y = row * SPACING;
+      if (y < generatedY) continue;
+
+      const cols = Math.floor(worldW / SPACING);
+      for (let col = 0; col <= cols; col++) {
+        let seed = (row * 73856093) ^ (col * 19349663) ^ 0x9e3779b9;
+        seed >>>= 0;
+
+        const jx = (rand01(seed) - 0.5) * 1.4; seed = xorshift32(seed);
+        const jy = (rand01(seed) - 0.5) * 1.4; seed = xorshift32(seed);
+
+        const rr = R_MIN + (R_MAX - R_MIN) * rand01(seed); seed = xorshift32(seed);
+        const s01 = rand01(seed);
+
+        addParticle(col * SPACING + jx, y + jy, rr, s01);
+      }
+    }
+    generatedY = targetY;
+  }
+
+  // =========================
+  // UI + INPUT STATE MACHINE
+  // =========================
+  const menuEl = document.getElementById("menu");
+  const menuText = document.getElementById("menuText");
+  const postEl = document.getElementById("post");
+  const postText = document.getElementById("postText");
+  const hudEl = document.getElementById("hud");
+
+  let state = "menuCategory";
+  let catIdx = 0;
+  let optIdx = 0;
+
+  let combo = playerDefaults();
+
+  let runMode = "single";
+  let runKey = null;
+  let runLabel = "";
+
+  function renderMenu() {
+    const unlocked = allTested();
+
+    let text = "";
+    text += "QBASIC MENU (use ↑ ↓, Enter)\n";
+    text += "----------------------------------------\n";
+    text += "Test one particle property per run ( * = tested )\n\n";
+
+    const menuItems = [...categories, FINAL_MENU_LABEL];
+    for (let i = 0; i < menuItems.length; i++) {
+      const isSel = (i === catIdx);
+      const prefix = isSel ? " > " : "   ";
+
+      if (i < categories.length) {
+        const cat = categories[i];
+        const star = categoryFullyTested(cat) ? " *" : "";
+        text += prefix + cat + star + "\n";
+      } else {
+        text += prefix + FINAL_MENU_LABEL + (unlocked ? "" : " [LOCKED]") + "\n";
+      }
+    }
+
+    text += "\n----------------------------------------\n";
+    text += `Tested: ${tested.size} / ${ALL_TEST_KEYS.length}\n`;
+    if (unlocked) {
+      text += "Final Level UNLOCKED: build a combo from Density + Size + Shape.\n";
+      if (bestComboLabel) text += `Best Combo So Far: ${bestComboLabel}  (${bestComboTime.toFixed(2)} s)\n`;
+    } else {
+      text += "Unlock Final Level by testing all objects above.\n";
+    }
+    text += "\nControls (in run): Left/Right = nudge";
+    if (PLAYER_SHOVE_Y > 0) text += " | Down = small shove";
+    text += "\nFor clean comparisons, do NOT hold Down.\n";
+
+    menuText.textContent = text;
+  }
+
+  function renderOptionsMenu(cat) {
+    const opts = optionsForCategory(cat);
+    let text = "";
+    text += "QBASIC MENU (use ↑ ↓, Enter)\n";
+    text += "----------------------------------------\n";
+    text += `Category: ${cat}\n`;
+    text += "Choose an option ( * = tested )\n\n";
+    for (let i = 0; i < opts.length; i++) {
+      const prefix = (i === optIdx) ? " > " : "   ";
+      text += prefix + formatOption(cat, opts[i]) + "\n";
+    }
+    text += "\n----------------------------------------\n";
+    text += "(Enter = start run, Esc = back)\n";
+    menuText.textContent = text;
+  }
+
+  function renderComboMenu(step) {
+    const opts = optionsForCategory(step);
+    let text = "";
+    text += "FINAL LEVEL: BUILD FASTEST PARTICLE\n";
+    text += "----------------------------------------\n";
+    text += "Pick Density + Size + Shape\n\n";
+    text += `Current: Density=${combo.density} | Size=${combo.size.split(" ")[0]} | Shape=${combo.shape.split(" ")[0]}\n\n`;
+    text += `Choose ${step}:\n\n`;
+    for (let i = 0; i < opts.length; i++) {
+      const prefix = (i === optIdx) ? " > " : "   ";
+      text += prefix + opts[i] + "\n";
+    }
+    text += "\n----------------------------------------\n";
+    text += "(Enter = confirm, Esc = back)\n";
+    menuText.textContent = text;
+  }
+
+  function showMenuCategory() {
+    state = "menuCategory";
+    catIdx = 0;
+    optIdx = 0;
+    menuEl.style.display = "flex";
+    postEl.style.display = "none";
+    hudEl.style.display = "none";
+    renderMenu();
+  }
+
+  const keys = new Set();
+  window.addEventListener("keydown", (e) => {
+    const intercept = ["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Enter","Escape"];
+    if (intercept.includes(e.key)) e.preventDefault();
+    keys.add(e.key);
+
+    if (state === "postRun") {
+      if (e.key === "Enter" || e.key === "Escape") showMenuCategory();
+      return;
+    }
+
+    if (state === "menuCategory") {
+      const menuItems = [...categories, FINAL_MENU_LABEL];
+      if (e.key === "ArrowUp") catIdx = (catIdx + menuItems.length - 1) % menuItems.length;
+      if (e.key === "ArrowDown") catIdx = (catIdx + 1) % menuItems.length;
+
+      if (e.key === "Enter") {
+        if (catIdx < categories.length) {
+          state = "menuOption";
+          optIdx = 0;
+          renderOptionsMenu(categories[catIdx]);
+        } else {
+          if (!allTested()) {
+            renderMenu();
+          } else {
+            combo = playerDefaults();
+            state = "comboPickDensity";
+            optIdx = 0;
+            renderComboMenu("Density");
+          }
+        }
+      } else {
+        renderMenu();
+      }
+      return;
+    }
+
+    if (state === "menuOption") {
+      const cat = categories[catIdx];
+      const opts = optionsForCategory(cat);
+
+      if (e.key === "ArrowUp") optIdx = (optIdx + opts.length - 1) % opts.length;
+      if (e.key === "ArrowDown") optIdx = (optIdx + 1) % opts.length;
+      if (e.key === "Escape") { state = "menuCategory"; optIdx = 0; renderMenu(); return; }
+
+      if (e.key === "Enter") {
+        const pick = opts[optIdx];
+        const profile = playerDefaults();
+        if (cat === "Density") profile.density = pick;
+        if (cat === "Size") profile.size = pick;
+        if (cat === "Shape") profile.shape = pick;
+
+        runMode = "single";
+        runKey = `${cat}:${pick}`;
+        runLabel = `TEST: ${cat} = ${pick}`;
+        startGame(profile);
+        return;
+      }
+
+      renderOptionsMenu(cat);
+      return;
+    }
+
+    if (state === "comboPickDensity" || state === "comboPickSize" || state === "comboPickShape") {
+      const step = (state === "comboPickDensity") ? "Density"
+                : (state === "comboPickSize") ? "Size"
+                : "Shape";
+      const opts = optionsForCategory(step);
+
+      if (e.key === "ArrowUp") optIdx = (optIdx + opts.length - 1) % opts.length;
+      if (e.key === "ArrowDown") optIdx = (optIdx + 1) % opts.length;
+
+      if (e.key === "Escape") {
+        if (state === "comboPickDensity") { state = "menuCategory"; optIdx = 0; renderMenu(); }
+        else if (state === "comboPickSize") { state = "comboPickDensity"; optIdx = 0; renderComboMenu("Density"); }
+        else { state = "comboPickSize"; optIdx = 0; renderComboMenu("Size"); }
+        return;
+      }
+
+      if (e.key === "Enter") {
+        const pick = opts[optIdx];
+        if (step === "Density") combo.density = pick;
+        if (step === "Size") combo.size = pick;
+        if (step === "Shape") combo.shape = pick;
+
+        if (state === "comboPickDensity") {
+          state = "comboPickSize";
+          optIdx = 0;
+          renderComboMenu("Size");
+        } else if (state === "comboPickSize") {
+          state = "comboPickShape";
+          optIdx = 0;
+          renderComboMenu("Shape");
+        } else {
+          runMode = "combo";
+          runKey = null;
+          runLabel = `COMBO: ${combo.density} / ${combo.size.split(" ")[0]} / ${combo.shape.split(" ")[0]}`;
+          startGame({ density: combo.density, size: combo.size, shape: combo.shape });
+        }
+        return;
+      }
+
+      renderComboMenu(step);
+      return;
+    }
+
+  }, { passive:false });
+
+  window.addEventListener("keyup", (e) => { keys.delete(e.key); }, { passive:true });
+
+  // =========================
+  // PLAYER (CPU)
+  // =========================
+  let player = null;
+  let camY = 0;
+  let timerStart = null;
+  let timerEnd = null;
+  let simTime = 0;
+
+  // =========================
+  // GAME START / END
+  // =========================
+  function startGame(profile) {
+    menuEl.style.display = "none";
+    postEl.style.display = "none";
+    hudEl.style.display = "block";
+    state = "play";
+
+    pbx = []; pby = []; px = []; py = []; pr = []; pheat = []; pseed = [];
+    pCount = 0;
+    generatedY = 0;
+
+    const dpr = dprInt();
+    const worldW = canvas.width / dpr;
+    const viewH = canvas.height / dpr;
+
+    const shapeSpec = buildPlayerShape(profile);
+    const hydro = computePlayerHydro(profile, shapeSpec);
+    const rhoP = densityToRho(profile.density);
+
+    const mass = Math.max(0.6, rhoP * hydro.volume * MASS_SCALE);
+
+    player = {
+      x: worldW * 0.5,
+      y: 40,
+      vx: 0,
+      vy: 0,
+      angle: 0,
+      omega: 0,
+
+      rho: rhoP,
+      volume: hydro.volume,
+      mass,
+
+      Cd: hydro.Cd,
+      area: hydro.area,
+      charLen: hydro.charLen,
+
+      shape: shapeSpec,
+      profile: profile
+    };
+
+    camY = 0;
+    timerStart = performance.now();
+    timerEnd = null;
+    simTime = 0;
+
+    ensureGenerated(worldW, camY, viewH);
+  }
+
+  function endRun(finalSeconds) {
+    if (runMode === "single" && runKey) {
+      tested.add(runKey);
+      const prev = bestTimes.get(runKey);
+      if (prev === undefined || finalSeconds < prev) bestTimes.set(runKey, finalSeconds);
+    }
+
+    if (runMode === "combo") {
+      if (finalSeconds < bestComboTime) {
+        bestComboTime = finalSeconds;
+        bestComboLabel = runLabel;
+      }
+    }
+
+    state = "postRun";
+    postEl.style.display = "flex";
+    menuEl.style.display = "none";
+    hudEl.style.display = "none";
+
+    const unlocked = allTested();
+
+    let text = "";
+    text += "RUN COMPLETE\n";
+    text += "----------------------------------------\n";
+    text += runLabel + "\n";
+    text += `Time: ${finalSeconds.toFixed(2)} s\n\n`;
+
+    if (runMode === "single" && runKey) {
+      const best = bestTimes.get(runKey);
+      if (best !== undefined) text += `Best for this test: ${best.toFixed(2)} s\n`;
+    }
+
+    if (unlocked) {
+      text += "\nFINAL LEVEL UNLOCKED\n";
+      if (bestComboLabel) text += `Best Combo So Far: ${bestComboLabel} (${bestComboTime.toFixed(2)} s)\n`;
+    } else {
+      text += `\nTested: ${tested.size} / ${ALL_TEST_KEYS.length}\n`;
+    }
+
+    text += "\n----------------------------------------\n";
+    text += "Test New Particle (press Enter)\n";
+    text += "----------------------------------------\n";
+    text += "Note: options with * in the menu have been tested.\n";
+
+    postText.textContent = text;
+  }
+
+  // =========================
+  // SIM LOOP (CPU physics)
+  // =========================
+  let lastT = performance.now();
+  let acc = 0;
+  const FIXED_DT = 1/60;
+
+  function step(dt) {
+    const dpr = dprInt();
+    const worldW = canvas.width / dpr;
+    const viewH = canvas.height / dpr;
+
+    simTime += dt;
+
+    ensureGenerated(worldW, camY, viewH);
+
+    const cullY = camY - CULL_BEHIND;
+    for (let i = 0; i < pCount; ) {
+      if (pby[i] < cullY) swapRemove(i);
+      else i++;
+    }
+
+    // -------------------------
+    // PLAYER: SETTLING IN WATER
+    // -------------------------
+    const aSett = G_PX * (1 - (RHO_W / player.rho));  // buoyancy reduces gravity
+    player.vy += aSett * dt;
+
+    if (keys.has("ArrowLeft"))  player.vx -= PLAYER_NUDGE_X * dt;
+    if (keys.has("ArrowRight")) player.vx += PLAYER_NUDGE_X * dt;
+    if (keys.has("ArrowDown") && PLAYER_SHOVE_Y > 0) player.vy += PLAYER_SHOVE_Y * dt;
+
+    const uP = fluidVel(player.x, player.y, simTime);
+    const rvx = player.vx - uP.ux;
+    const rvy = player.vy - uP.uy;
+    const rSpeed = hypot2(rvx, rvy);
+
+    let CdEff = player.Cd;
+    let areaEff = player.area;
+
+    if (player.shape.kind === "rect" && rSpeed > 1e-6) {
+      const velAng = Math.atan2(rvy, rvx);
+      const diff = wrapPi(player.angle - velAng);
+      const broad = Math.abs(Math.sin(diff)); // 0=edge-first, 1=broadside
+
+      CdEff = player.Cd * (0.55 + 0.95 * broad);
+      areaEff = player.area * (0.25 + 0.85 * broad);
+
+      const desired = velAng + Math.PI/2;
+      const err = wrapPi(desired - player.angle);
+      player.omega += (err * ALIGN_K) * dt;
+      player.omega += Math.sin(simTime * 3.2 + player.x * 0.02) * FLUTTER_K * dt;
+      player.omega *= ANG_DAMP;
+      player.angle += player.omega * dt;
+    }
+
+    if (rSpeed > 1e-6) {
+      const kq = (DRAG_QUAD_K * (CdEff * areaEff)) / player.mass;
+      player.vx -= (rvx * rSpeed) * kq * dt;
+      player.vy -= (rvy * rSpeed) * kq * dt;
+
+      const kl = (DRAG_LIN_K * player.charLen) / player.mass;
+      player.vx -= rvx * kl * dt;
+      player.vy -= rvy * kl * dt;
+    }
+
+    // clamp + integrate
+    const sp = hypot2(player.vx, player.vy);
+    if (sp > MAX_SPEED) {
+      const s = MAX_SPEED / sp;
+      player.vx *= s; player.vy *= s;
+    }
+
+    player.x += player.vx * dt;
+    player.y += player.vy * dt;
+
+    player.x = clamp(player.x, 20, worldW - 20);
+    player.y = clamp(player.y, 0, WORLD_H);
+
+    // -------------------------
+    // ACTIVE BAND FOR MATRIX
+    // -------------------------
+    const activeTop = Math.max(0, player.y - ACTIVE_PAD_TOP);
+    const activeBot = Math.min(WORLD_H, player.y + viewH + ACTIVE_PAD_BOTTOM);
+
+    const activeIdx = [];
+    for (let i = 0; i < pCount; i++) {
+      const y = pby[i];
+      if (y >= activeTop && y <= activeBot) activeIdx.push(i);
+      else pheat[i] *= 0.92;
+    }
+
+    // -------------------------
+    // MATRIX UPDATE (incompressible-looking)
+    // -------------------------
+    const wakeR = WAKE_RADIUS_PAD + (player.shape.baseR || 12);
+    const wakeR2 = wakeR * wakeR;
+
+    for (let k = 0; k < activeIdx.length; k++) {
+      const i = activeIdx[k];
+
+      const u = fluidVel(pbx[i], pby[i], simTime);
+
+      let x = pbx[i] + u.ux * MATRIX_DISP;
+      let y = pby[i] + u.uy * MATRIX_DISP;
+
+      const dx = x - player.x;
+      const dy = y - player.y;
+      const d2 = dx*dx + dy*dy;
+      if (d2 < wakeR2 && d2 > 1e-6) {
+        const d = Math.sqrt(d2);
+        const nx = dx / d, ny = dy / d;
+        const s = (wakeR - d) / wakeR;
+        const push = (s * s) * WAKE_PUSH_PX;
+        x += nx * push;
+        y += ny * push;
+      }
+
+      x = clamp(x, pr[i], worldW - pr[i]);
+      y = clamp(y, pr[i], WORLD_H - pr[i]);
+
+      px[i] = x;
+      py[i] = y;
+
+      const v = hypot2(u.ux, u.uy);
+      const h = Math.min(1, v / 120);
+      pheat[i] = pheat[i] * 0.90 + h * 0.10;
+    }
+
+    // camera follows
+    camY = clamp(player.y - viewH * 0.20, 0, Math.max(0, WORLD_H - viewH));
+
+    // finish
+    if (player.y >= WORLD_H - 10 && timerEnd === null) {
+      timerEnd = performance.now();
+      const seconds = (timerEnd - (timerStart ?? timerEnd)) / 1000;
+      endRun(seconds);
+      return;
+    }
+
+    const now = performance.now();
+    const t = (timerStart === null) ? 0 : ((now - timerStart) / 1000);
+    const remain = Math.max(0, WORLD_H - player.y);
+
+    hudEl.innerHTML =
+      `<b>RUN</b>  y=${player.y.toFixed(0)} / ${WORLD_H}` +
+      `<br><b>Timer</b>: ${t.toFixed(2)} s` +
+      `<br><b>Remaining</b>: ${remain.toFixed(0)} px` +
+      `<br><b>Mode</b>: ${runMode === "combo" ? "Final Combo" : "Test"}` +
+      `<br><span class="dim">${runLabel}</span>` +
+      `<br><span class="dim">ρ=${player.rho.toFixed(2)}  Cd=${player.Cd.toFixed(2)}  m=${player.mass.toFixed(2)}</span>`;
+  }
+
+  // =========================
+  // RENDER (GPU)
+  // =========================
+  function render() {
+    const dpr = dprInt();
+    const viewH = canvas.height / dpr;
+    const camX = 0;
+
+    gl.disable(gl.DEPTH_TEST);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    gl.clearColor(0.04, 0.05, 0.06, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    // matrix points
+    gl.useProgram(progPoints);
+    gl.uniform2f(u_cam_pts, camX * dpr, camY * dpr);
+    gl.uniform2f(u_res_pts, canvas.width, canvas.height);
+
+    const screenTop = camY - 120;
+    const screenBot = camY + viewH + 240;
+
+    const tmp = [];
+    for (let i = 0; i < pCount; i++) {
+      const y = py[i];
+      if (y < screenTop || y > screenBot) continue;
+      tmp.push(px[i] * dpr, py[i] * dpr, pr[i] * dpr, pheat[i]);
+    }
+    const particleData = new Float32Array(tmp);
+
+    gl.bindVertexArray(vaoPts);
+    gl.bindBuffer(gl.ARRAY_BUFFER, vboPts);
+    gl.bufferData(gl.ARRAY_BUFFER, particleData, gl.DYNAMIC_DRAW);
+
+    gl.uniform3f(u_amb_pts, 0.55, 0.60, 0.62);
+    gl.uniform3f(u_hot_pts, 0.95, 0.78, 0.20);
+    gl.drawArrays(gl.POINTS, 0, particleData.length / 4);
+
+    // player
+    if (!player) return;
+
+    if (player.shape.kind === "rect") {
+      gl.useProgram(progRect);
+      gl.uniform2f(u_cam_rc, camX * dpr, camY * dpr);
+      gl.uniform2f(u_res_rc, canvas.width, canvas.height);
+      gl.uniform2f(u_center_rc, player.x * dpr, player.y * dpr);
+      gl.uniform2f(u_half_rc, player.shape.hx * dpr, player.shape.hy * dpr);
+      gl.uniform1f(u_angle_rc, player.angle);
+      gl.uniform3f(u_fill_rc, 0.18, 0.92, 0.45);
+      gl.uniform3f(u_edge_rc, 0.85, 1.00, 0.85);
+      gl.bindVertexArray(vaoRect);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      gl.bindVertexArray(null);
+    } else {
+      gl.useProgram(progPoints);
+      gl.uniform2f(u_cam_pts, camX * dpr, camY * dpr);
+      gl.uniform2f(u_res_pts, canvas.width, canvas.height);
+
+      const pTmp = [];
+      for (const comp of player.shape.comps) {
+        pTmp.push((player.x + comp.ox) * dpr, (player.y + comp.oy) * dpr, comp.r * dpr, 1.0);
+      }
+      const playerData = new Float32Array(pTmp);
+
+      gl.bindVertexArray(vaoPts);
+      gl.bindBuffer(gl.ARRAY_BUFFER, vboPts);
+      gl.bufferData(gl.ARRAY_BUFFER, playerData, gl.DYNAMIC_DRAW);
+      gl.uniform3f(u_amb_pts, 0.18, 0.92, 0.45);
+      gl.uniform3f(u_hot_pts, 0.85, 1.00, 0.85);
+      gl.drawArrays(gl.POINTS, 0, playerData.length / 4);
+
+      gl.bindVertexArray(null);
+    }
+  }
+
+  // =========================
+  // MAIN LOOP
+  // =========================
+  function loop(tNow) {
+    const dt = Math.min(0.05, (tNow - lastT) / 1000);
+    lastT = tNow;
+
+    if (state === "play") {
+      acc += dt;
+      while (acc >= FIXED_DT) {
+        step(FIXED_DT);
+        if (state !== "play") break;
+        acc -= FIXED_DT;
+      }
+      render();
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  // boot
+  showMenuCategory();
+  requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
